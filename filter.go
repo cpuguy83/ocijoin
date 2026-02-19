@@ -1,6 +1,7 @@
 package ocijoin
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -9,6 +10,8 @@ import (
 
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images"
+	"github.com/opencontainers/go-digest"
+	imgspecs "github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
@@ -157,6 +160,96 @@ func (u *unwrapped) resolve(ctx context.Context) (Layout, error) {
 	// No matching nested index found; return the original layout unchanged.
 	return u.layout, nil
 }
+
+// Wrap returns a Layout that nests l's index inside a new outer index.
+// The inner index is serialized as a blob and referenced by a single
+// descriptor in the outer index. The descriptor carries the given annotations
+// and has media type application/vnd.oci.image.index.v1+json.
+//
+// This is the inverse of [Unwrap]: Unwrap(Wrap(l, ann)) produces a layout
+// whose Index is equivalent to l's Index.
+//
+// The returned Layout serves both the synthetic inner-index blob and all
+// blobs from l.
+func Wrap(l Layout, annotations map[string]string) Layout {
+	return &wrapped{layout: l, annotations: annotations}
+}
+
+// wrapped implements Layout by nesting the underlying layout's index
+// inside a new outer index.
+type wrapped struct {
+	layout      Layout
+	annotations map[string]string
+
+	once  sync.Once
+	outer *ocispec.Index
+	blob  []byte // serialized inner index
+	desc  ocispec.Descriptor
+	err   error
+}
+
+func (w *wrapped) Index(ctx context.Context) (*ocispec.Index, error) {
+	w.once.Do(func() {
+		w.outer, w.err = w.build(ctx)
+	})
+	return w.outer, w.err
+}
+
+func (w *wrapped) build(ctx context.Context) (*ocispec.Index, error) {
+	idx, err := w.layout.Index(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("reading index: %w", err)
+	}
+
+	data, err := json.Marshal(idx)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling inner index: %w", err)
+	}
+	w.blob = data
+
+	w.desc = ocispec.Descriptor{
+		MediaType:   ocispec.MediaTypeImageIndex,
+		Digest:      digest.FromBytes(data),
+		Size:        int64(len(data)),
+		Annotations: w.annotations,
+	}
+
+	outer := &ocispec.Index{
+		Versioned: imgspecs.Versioned{SchemaVersion: 2},
+		MediaType: ocispec.MediaTypeImageIndex,
+		Manifests: []ocispec.Descriptor{w.desc},
+	}
+
+	return outer, nil
+}
+
+func (w *wrapped) ReaderAt(ctx context.Context, desc ocispec.Descriptor) (content.ReaderAt, error) {
+	// Ensure the inner index blob has been built.
+	if _, err := w.Index(ctx); err != nil {
+		return nil, err
+	}
+
+	// Serve the synthetic inner-index blob if requested.
+	if desc.Digest == w.desc.Digest {
+		return newBytesReaderAt(w.blob), nil
+	}
+
+	return w.layout.ReaderAt(ctx, desc)
+}
+
+// bytesReaderAt implements content.ReaderAt over an in-memory byte slice.
+type bytesReaderAt struct {
+	*io.SectionReader
+}
+
+func newBytesReaderAt(b []byte) *bytesReaderAt {
+	r := bytes.NewReader(b)
+	return &bytesReaderAt{
+		SectionReader: io.NewSectionReader(r, 0, int64(len(b))),
+	}
+}
+
+func (b *bytesReaderAt) Close() error { return nil }
 
 // staticLayout is a Layout backed by a pre-built index and an existing
 // content.Provider for blob access.

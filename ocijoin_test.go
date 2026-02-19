@@ -787,6 +787,121 @@ func TestUnwrapFilterAndJoin(t *testing.T) {
 	}
 }
 
+func TestWrap(t *testing.T) {
+	blob1 := []byte("manifest one")
+	blob2 := []byte("manifest two")
+	dgst1 := blobDigest(blob1)
+	dgst2 := blobDigest(blob2)
+
+	dir := makeTestLayout(t, map[digest.Digest][]byte{dgst1: blob1, dgst2: blob2})
+	layout, err := NewLocalLayout(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	annotations := map[string]string{
+		"org.opencontainers.image.ref.name": "v1.0",
+	}
+	wrapped := Wrap(layout, annotations)
+
+	// Outer index should have exactly one descriptor.
+	outerIdx, err := wrapped.Index(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(outerIdx.Manifests) != 1 {
+		t.Fatalf("expected 1 outer descriptor, got %d", len(outerIdx.Manifests))
+	}
+	outerDesc := outerIdx.Manifests[0]
+	if outerDesc.MediaType != ocispec.MediaTypeImageIndex {
+		t.Fatalf("expected outer descriptor media type %s, got %s", ocispec.MediaTypeImageIndex, outerDesc.MediaType)
+	}
+	if outerDesc.Annotations["org.opencontainers.image.ref.name"] != "v1.0" {
+		t.Fatalf("expected annotation v1.0, got %s", outerDesc.Annotations["org.opencontainers.image.ref.name"])
+	}
+
+	// Should be able to read the synthetic inner index blob.
+	ra, err := wrapped.ReaderAt(ctx, outerDesc)
+	if err != nil {
+		t.Fatalf("reading inner index blob: %v", err)
+	}
+	data := make([]byte, ra.Size())
+	if _, err := ra.ReadAt(data, 0); err != nil && err != io.EOF {
+		t.Fatal(err)
+	}
+	ra.Close()
+
+	var innerIdx ocispec.Index
+	if err := json.Unmarshal(data, &innerIdx); err != nil {
+		t.Fatalf("parsing inner index: %v", err)
+	}
+	if len(innerIdx.Manifests) != 2 {
+		t.Fatalf("expected 2 inner manifests, got %d", len(innerIdx.Manifests))
+	}
+
+	// Original blobs should still be accessible.
+	for dgst, expected := range map[digest.Digest][]byte{dgst1: blob1, dgst2: blob2} {
+		ra, err := wrapped.ReaderAt(ctx, ocispec.Descriptor{Digest: dgst, Size: int64(len(expected))})
+		if err != nil {
+			t.Fatalf("reading blob %s: %v", dgst, err)
+		}
+		got := make([]byte, ra.Size())
+		if _, err := ra.ReadAt(got, 0); err != nil && err != io.EOF {
+			t.Fatal(err)
+		}
+		ra.Close()
+		if !bytes.Equal(got, expected) {
+			t.Fatalf("blob %s: expected %q, got %q", dgst, expected, got)
+		}
+	}
+}
+
+func TestWrapUnwrapRoundtrip(t *testing.T) {
+	blob1 := []byte("platform manifest amd64")
+	blob2 := []byte("platform manifest arm64")
+	dgst1 := blobDigest(blob1)
+	dgst2 := blobDigest(blob2)
+
+	dir := makeTestLayout(t, map[digest.Digest][]byte{dgst1: blob1, dgst2: blob2})
+	layout, err := NewLocalLayout(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	// Get original index for comparison.
+	origIdx, err := layout.Index(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wrap then Unwrap should recover the original index contents.
+	wrapped := Wrap(layout, map[string]string{"org.opencontainers.image.ref.name": "test"})
+	roundtripped := Unwrap(wrapped)
+
+	rtIdx, err := roundtripped.Index(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(rtIdx.Manifests) != len(origIdx.Manifests) {
+		t.Fatalf("roundtrip: expected %d manifests, got %d", len(origIdx.Manifests), len(rtIdx.Manifests))
+	}
+
+	origDigests := make(map[digest.Digest]bool)
+	for _, d := range origIdx.Manifests {
+		origDigests[d.Digest] = true
+	}
+	for _, d := range rtIdx.Manifests {
+		if !origDigests[d.Digest] {
+			t.Fatalf("roundtrip: unexpected digest %s", d.Digest)
+		}
+	}
+}
+
 func TestJoinDeduplication(t *testing.T) {
 	blob1 := []byte("shared blob")
 	dgst1 := blobDigest(blob1)
