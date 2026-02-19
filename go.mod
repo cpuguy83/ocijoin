@@ -1,4 +1,4 @@
-module github.com/cpuguy83/oci-join
+module github.com/cpuguy83/ocijoin
 
 go 1.25.6
 
