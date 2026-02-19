@@ -8,9 +8,9 @@ import (
 	"os"
 	"path/filepath"
 
-	ocijoin "github.com/cpuguy83/oci-join"
-	"github.com/cpuguy83/oci-join/direxport"
-	"github.com/cpuguy83/oci-join/tarexport"
+	"github.com/cpuguy83/ocijoin"
+	"github.com/cpuguy83/ocijoin/direxport"
+	"github.com/cpuguy83/ocijoin/tarexport"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 

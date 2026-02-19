@@ -9,7 +9,7 @@ import (
 	"io"
 
 	"github.com/containerd/containerd/v2/core/images"
-	"github.com/cpuguy83/oci-join"
+	"github.com/cpuguy83/ocijoin"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )

@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	ocijoin "github.com/cpuguy83/oci-join"
+	"github.com/cpuguy83/ocijoin"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
