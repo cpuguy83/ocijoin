@@ -303,8 +303,13 @@ func TestFilterWithJoin(t *testing.T) {
 			},
 		},
 	}
-	idxData1, _ := json.Marshal(idx1)
-	os.WriteFile(filepath.Join(dir1, "index.json"), idxData1, 0o644)
+	idxData1, err := json.Marshal(idx1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir1, "index.json"), idxData1, 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	// Layout 2: has a plain platform manifest.
 	dir2 := makeTestLayout(t, map[digest.Digest][]byte{dgst3: blob3})
@@ -606,8 +611,12 @@ func TestUnwrapWithFilter(t *testing.T) {
 	// Write inner index blobs.
 	for dgst, data := range map[digest.Digest][]byte{inner1Digest: inner1Data, inner2Digest: inner2Data} {
 		algoDir := filepath.Join(dir, "blobs", dgst.Algorithm().String())
-		os.MkdirAll(algoDir, 0o755)
-		os.WriteFile(filepath.Join(algoDir, dgst.Encoded()), data, 0o644)
+		if err := os.MkdirAll(algoDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(algoDir, dgst.Encoded()), data, 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	// Outer index: two image index descriptors with different tags.
@@ -628,12 +637,22 @@ func TestUnwrapWithFilter(t *testing.T) {
 			},
 		},
 	}
-	outerData, _ := json.Marshal(outerIdx)
-	os.WriteFile(filepath.Join(dir, "index.json"), outerData, 0o644)
+	outerData, err := json.Marshal(outerIdx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "index.json"), outerData, 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	ociLayout := ocispec.ImageLayout{Version: ocispec.ImageLayoutVersion}
-	layoutData, _ := json.Marshal(ociLayout)
-	os.WriteFile(filepath.Join(dir, ocispec.ImageLayoutFile), layoutData, 0o644)
+	layoutData, err := json.Marshal(ociLayout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ocispec.ImageLayoutFile), layoutData, 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	layout, err := NewLocalLayout(dir)
 	if err != nil {

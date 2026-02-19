@@ -1,0 +1,23 @@
+version: "2"
+
+formatters:
+  enable:
+    - goimports
+
+linters:
+  enable:
+    - misspell
+  exclusions:
+    rules:
+      - linters:
+          - staticcheck
+        text: QF1008 # Omit embedded fields from selector expression. https://staticcheck.dev/docs/checks/#QF1008
+  settings:
+    errcheck:
+      exclude-functions:
+        - (*os.File).Close
+        - (io.Closer).Close
+        - (io.ReadCloser).Close
+        - (io.WriteCloser).Close
+        - (io/fs.File).Close
+        - (*archive/tar.Writer).Close

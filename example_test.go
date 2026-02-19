@@ -3,42 +3,13 @@ package ocijoin_test
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 
 	"github.com/cpuguy83/ocijoin"
 	"github.com/cpuguy83/ocijoin/direxport"
 	"github.com/cpuguy83/ocijoin/tarexport"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
-
-// Create a temporary OCI layout directory for examples.
-func exampleLayout(descs []ocispec.Descriptor, blobs map[string][]byte) string {
-	dir, err := os.MkdirTemp("", "ocijoin-example-*")
-	if err != nil {
-		panic(err)
-	}
-
-	idx := ocispec.Index{
-		MediaType: ocispec.MediaTypeImageIndex,
-		Manifests: descs,
-	}
-	idxData, _ := json.Marshal(idx)
-	os.WriteFile(filepath.Join(dir, "index.json"), idxData, 0o644)
-
-	layout := ocispec.ImageLayout{Version: ocispec.ImageLayoutVersion}
-	layoutData, _ := json.Marshal(layout)
-	os.WriteFile(filepath.Join(dir, ocispec.ImageLayoutFile), layoutData, 0o644)
-
-	blobDir := filepath.Join(dir, "blobs", "sha256")
-	os.MkdirAll(blobDir, 0o755)
-	for name, data := range blobs {
-		os.WriteFile(filepath.Join(blobDir, name), data, 0o644)
-	}
-	return dir
-}
 
 func ExampleNewLocalLayout() {
 	// NewLocalLayout reads an OCI layout directory from disk.
