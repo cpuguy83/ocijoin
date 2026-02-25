@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/containerd/containerd/v2/core/images"
@@ -51,80 +52,205 @@ type blobEntry struct {
 	size    int64
 }
 
-// Open implements [fs.FS].
-func (f *layoutFS) Open(name string) (fs.File, error) {
+// pathKind classifies a parsed OCI layout path.
+type pathKind int
+
+const (
+	pathRoot      pathKind = iota // "."
+	pathOCILayout                 // "oci-layout"
+	pathIndexJSON                 // "index.json"
+	pathBlobsDir                  // "blobs"
+	pathAlgoDir                   // "blobs/<algo>"
+	pathBlob                      // "blobs/<algo>/<encoded>"
+)
+
+// parsePath validates and classifies an fs path within the OCI layout.
+// It returns the path kind, and for blob-related paths, the algorithm
+// and encoded digest components.
+func parsePath(name string) (kind pathKind, algo, encoded string, err error) {
 	if !fs.ValidPath(name) {
-		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrInvalid}
+		return 0, "", "", fs.ErrInvalid
 	}
 
 	switch name {
 	case ".":
-		return f.openRootDir()
+		return pathRoot, "", "", nil
 	case "oci-layout":
-		return f.openOCILayout()
+		return pathOCILayout, "", "", nil
 	case "index.json":
-		return f.openIndexJSON()
+		return pathIndexJSON, "", "", nil
 	case "blobs":
-		return f.openBlobsDir()
+		return pathBlobsDir, "", "", nil
 	}
 
-	// blobs/<algo> or blobs/<algo>/<encoded>
 	if !strings.HasPrefix(name, "blobs/") {
-		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
+		return 0, "", "", fs.ErrNotExist
 	}
 
 	rest := strings.TrimPrefix(name, "blobs/")
 	algo, encoded, hasEncoded := strings.Cut(rest, "/")
 
 	if !hasEncoded {
-		// blobs/<algo> directory
-		return f.openAlgoDir(name, algo)
+		return pathAlgoDir, algo, "", nil
 	}
 
-	// Reject paths with extra slashes (e.g. "blobs/sha256/abc/extra").
 	if strings.Contains(encoded, "/") {
-		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
+		return 0, "", "", fs.ErrNotExist
 	}
 
-	return f.openBlob(name, algo, encoded)
+	return pathBlob, algo, encoded, nil
 }
 
-// Stat implements [fs.StatFS].
+func (f *layoutFS) Open(name string) (fs.File, error) {
+	kind, algo, encoded, err := parsePath(name)
+	if err != nil {
+		return nil, &fs.PathError{Op: "open", Path: name, Err: err}
+	}
+
+	switch kind {
+	case pathRoot:
+		return f.openRootDir()
+	case pathOCILayout:
+		return f.openOCILayout()
+	case pathIndexJSON:
+		return f.openIndexJSON()
+	case pathBlobsDir:
+		return f.openBlobsDir()
+	case pathAlgoDir:
+		return f.openAlgoDir(name, algo)
+	case pathBlob:
+		return f.openBlob(name, algo, encoded)
+	}
+
+	return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
+}
+
 func (f *layoutFS) Stat(name string) (fs.FileInfo, error) {
-	file, err := f.Open(name)
+	kind, algo, encoded, err := parsePath(name)
 	if err != nil {
-		return nil, err
+		return nil, &fs.PathError{Op: "stat", Path: name, Err: err}
 	}
-	defer file.Close()
-	return file.Stat()
+
+	switch kind {
+	case pathRoot:
+		return fileInfo{name: ".", dir: true}, nil
+	case pathOCILayout:
+		return fileInfo{name: "oci-layout", size: int64(len(ociLayoutBytes))}, nil
+	case pathIndexJSON:
+		data, err := f.marshalIndex()
+		if err != nil {
+			return nil, &fs.PathError{Op: "stat", Path: name, Err: err}
+		}
+		return fileInfo{name: "index.json", size: int64(len(data))}, nil
+	case pathBlobsDir:
+		// Ensure blobs are enumerated so we can confirm the dir exists.
+		if _, _, err := f.enumerateBlobs(); err != nil {
+			return nil, &fs.PathError{Op: "stat", Path: name, Err: err}
+		}
+		return fileInfo{name: "blobs", dir: true}, nil
+	case pathAlgoDir:
+		byAlgo, _, err := f.enumerateBlobs()
+		if err != nil {
+			return nil, &fs.PathError{Op: "stat", Path: name, Err: err}
+		}
+		if _, ok := byAlgo[algo]; !ok {
+			return nil, &fs.PathError{Op: "stat", Path: name, Err: fs.ErrNotExist}
+		}
+		return fileInfo{name: algo, dir: true}, nil
+	case pathBlob:
+		dgst := digest.NewDigestFromEncoded(digest.Algorithm(algo), encoded)
+		ra, err := f.layout.ReaderAt(f.ctx, ocispec.Descriptor{Digest: dgst})
+		if err != nil {
+			return nil, &fs.PathError{Op: "stat", Path: name, Err: fs.ErrNotExist}
+		}
+		defer ra.Close()
+		return fileInfo{name: encoded, size: ra.Size()}, nil
+	}
+
+	return nil, &fs.PathError{Op: "stat", Path: name, Err: fs.ErrNotExist}
 }
 
-// ReadFile implements [fs.ReadFileFS].
 func (f *layoutFS) ReadFile(name string) ([]byte, error) {
-	file, err := f.Open(name)
+	kind, algo, encoded, err := parsePath(name)
 	if err != nil {
-		return nil, err
+		return nil, &fs.PathError{Op: "read", Path: name, Err: err}
 	}
-	defer file.Close()
-	return io.ReadAll(file)
+
+	switch kind {
+	case pathOCILayout:
+		return append([]byte{}, ociLayoutBytes...), nil
+	case pathIndexJSON:
+		data, err := f.marshalIndex()
+		if err != nil {
+			return nil, &fs.PathError{Op: "read", Path: name, Err: err}
+		}
+		return append([]byte{}, data...), nil
+	case pathBlob:
+		dgst := digest.NewDigestFromEncoded(digest.Algorithm(algo), encoded)
+		ra, err := f.layout.ReaderAt(f.ctx, ocispec.Descriptor{Digest: dgst})
+		if err != nil {
+			return nil, &fs.PathError{Op: "read", Path: name, Err: fs.ErrNotExist}
+		}
+		defer ra.Close()
+		buf := make([]byte, ra.Size())
+		if _, err := ra.ReadAt(buf, 0); err != nil && err != io.EOF {
+			return nil, &fs.PathError{Op: "read", Path: name, Err: err}
+		}
+		return buf, nil
+	case pathRoot, pathBlobsDir, pathAlgoDir:
+		return nil, &fs.PathError{Op: "read", Path: name, Err: syscall.EISDIR}
+	}
+
+	return nil, &fs.PathError{Op: "read", Path: name, Err: fs.ErrNotExist}
 }
 
-// ReadDir implements [fs.ReadDirFS].
 func (f *layoutFS) ReadDir(name string) ([]fs.DirEntry, error) {
-	file, err := f.Open(name)
+	kind, algo, _, err := parsePath(name)
 	if err != nil {
-		return nil, err
+		return nil, &fs.PathError{Op: "readdir", Path: name, Err: err}
 	}
-	defer file.Close()
 
-	dir, ok := file.(fs.ReadDirFile)
-	if !ok {
-		return nil, &fs.PathError{Op: "readdir", Path: name, Err: fmt.Errorf("not a directory")}
+	switch kind {
+	case pathRoot:
+		data, err := f.marshalIndex()
+		if err != nil {
+			return nil, &fs.PathError{Op: "readdir", Path: name, Err: err}
+		}
+		return []fs.DirEntry{
+			dirEntry{name: "blobs", dir: true},
+			dirEntry{name: "index.json", size: int64(len(data))},
+			dirEntry{name: "oci-layout", size: int64(len(ociLayoutBytes))},
+		}, nil
+	case pathBlobsDir:
+		_, algos, err := f.enumerateBlobs()
+		if err != nil {
+			return nil, &fs.PathError{Op: "readdir", Path: name, Err: err}
+		}
+		entries := make([]fs.DirEntry, len(algos))
+		for i, a := range algos {
+			entries[i] = dirEntry{name: a, dir: true}
+		}
+		return entries, nil
+	case pathAlgoDir:
+		byAlgo, _, err := f.enumerateBlobs()
+		if err != nil {
+			return nil, &fs.PathError{Op: "readdir", Path: name, Err: err}
+		}
+		blobs, ok := byAlgo[algo]
+		if !ok {
+			return nil, &fs.PathError{Op: "readdir", Path: name, Err: fs.ErrNotExist}
+		}
+		entries := make([]fs.DirEntry, len(blobs))
+		for i, b := range blobs {
+			entries[i] = dirEntry{name: b.encoded, size: b.size}
+		}
+		return entries, nil
+	case pathOCILayout, pathIndexJSON, pathBlob:
+		return nil, &fs.PathError{Op: "readdir", Path: name, Err: syscall.ENOTDIR}
 	}
-	return dir.ReadDir(-1)
+
+	return nil, &fs.PathError{Op: "readdir", Path: name, Err: fs.ErrNotExist}
 }
-
-// --- index.json and oci-layout ---
 
 func (f *layoutFS) marshalIndex() ([]byte, error) {
 	f.indexOnce.Do(func() {
@@ -154,8 +280,6 @@ func (f *layoutFS) openIndexJSON() (fs.File, error) {
 	}
 	return newBytesFile("index.json", data), nil
 }
-
-// --- blob enumeration ---
 
 func (f *layoutFS) enumerateBlobs() (map[string][]blobEntry, []string, error) {
 	f.blobsOnce.Do(func() {
@@ -210,37 +334,33 @@ func (f *layoutFS) enumerateBlobs() (map[string][]blobEntry, []string, error) {
 
 func (f *layoutFS) openBlob(name, algo, encoded string) (fs.File, error) {
 	dgst := digest.NewDigestFromEncoded(digest.Algorithm(algo), encoded)
-	if err := dgst.Validate(); err != nil {
-		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
-	}
-
 	desc := ocispec.Descriptor{Digest: dgst}
 	ra, err := f.layout.ReaderAt(f.ctx, desc)
 	if err != nil {
 		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
 	}
 
-	return &blobFile{
+	return &readerAtFile{
 		name:   encoded,
-		ra:     ra,
+		closer: ra,
 		reader: io.NewSectionReader(ra, 0, ra.Size()),
-		size:   ra.Size(),
 	}, nil
 }
 
-// blobFile implements fs.File over a content.ReaderAt.
-type blobFile struct {
+// readerAtFile implements fs.File over a content.ReaderAt.
+type readerAtFile struct {
 	name   string
-	ra     io.Closer
+	closer io.Closer
 	reader *io.SectionReader
-	size   int64
 }
 
-func (b *blobFile) Read(p []byte) (int, error)              { return b.reader.Read(p) }
-func (b *blobFile) ReadAt(p []byte, off int64) (int, error) { return b.reader.ReadAt(p, off) }
-func (b *blobFile) Close() error                            { return b.ra.Close() }
-func (b *blobFile) Stat() (fs.FileInfo, error)              { return fileInfo{b.name, b.size, false}, nil }
-func (b *blobFile) Seek(offset int64, whence int) (int64, error) {
+func (b *readerAtFile) Read(p []byte) (int, error)              { return b.reader.Read(p) }
+func (b *readerAtFile) ReadAt(p []byte, off int64) (int, error) { return b.reader.ReadAt(p, off) }
+func (b *readerAtFile) Close() error                            { return b.closer.Close() }
+func (b *readerAtFile) Stat() (fs.FileInfo, error) {
+	return fileInfo{b.name, b.reader.Size(), false}, nil
+}
+func (b *readerAtFile) Seek(offset int64, whence int) (int64, error) {
 	return b.reader.Seek(offset, whence)
 }
 
@@ -302,7 +422,7 @@ type dir struct {
 }
 
 func (d *dir) Read([]byte) (int, error) {
-	return 0, &fs.PathError{Op: "read", Path: d.name, Err: fmt.Errorf("is a directory")}
+	return 0, &fs.PathError{Op: "read", Path: d.name, Err: syscall.EISDIR}
 }
 
 func (d *dir) Close() error { return nil }
@@ -335,9 +455,6 @@ func (d *dir) ReadDir(n int) ([]fs.DirEntry, error) {
 	return entries, nil
 }
 
-// --- shared fileInfo and dirEntry ---
-
-// fileInfo implements fs.FileInfo for files and directories.
 type fileInfo struct {
 	name string
 	size int64
@@ -375,9 +492,6 @@ func (e dirEntry) Info() (fs.FileInfo, error) {
 	return fileInfo(e), nil
 }
 
-// --- bytesFile for oci-layout and index.json ---
-
-// bytesFile implements fs.File over an in-memory byte slice.
 type bytesFile struct {
 	name   string
 	reader *bytes.Reader
